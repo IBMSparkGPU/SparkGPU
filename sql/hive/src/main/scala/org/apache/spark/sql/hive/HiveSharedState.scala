@@ -18,7 +18,7 @@
 package org.apache.spark.sql.hive
 
 import org.apache.spark.SparkContext
-import org.apache.spark.sql.hive.client.{HiveClient, HiveClientImpl}
+import org.apache.spark.sql.hive.client.HiveClient
 import org.apache.spark.sql.internal.SharedState
 
 
@@ -29,19 +29,18 @@ import org.apache.spark.sql.internal.SharedState
 private[hive] class HiveSharedState(override val sparkContext: SparkContext)
   extends SharedState(sparkContext) {
 
-  // TODO: just share the IsolatedClientLoader instead of the client instances themselves
+  // TODO: just share the IsolatedClientLoader instead of the client instance itself
 
   /**
    * A Hive client used to interact with the metastore.
    */
   // This needs to be a lazy val at here because TestHiveSharedState is overriding it.
   lazy val metadataHive: HiveClient = {
-    HiveUtils.newClientForMetadata(sparkContext.conf, sparkContext.hadoopConfiguration)
+    HiveUtils.newClientForMetadata(sparkContext.conf, hadoopConf)
   }
 
   /**
    * A catalog that interacts with the Hive metastore.
    */
-  override lazy val externalCatalog = new HiveExternalCatalog(metadataHive)
-
+  override lazy val externalCatalog = new HiveExternalCatalog(metadataHive, hadoopConf)
 }

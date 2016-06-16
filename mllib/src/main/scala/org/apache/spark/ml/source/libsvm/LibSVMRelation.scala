@@ -26,14 +26,15 @@ import org.apache.hadoop.mapreduce.{Job, RecordWriter, TaskAttemptContext}
 import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.mllib.linalg.{Vector, Vectors, VectorUDT}
-import org.apache.spark.mllib.regression.LabeledPoint
+import org.apache.spark.ml.feature.LabeledPoint
+import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.sql.{DataFrame, DataFrameReader, Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.RowEncoder
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, JoinedRow}
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
+import org.apache.spark.sql.execution.command.CreateDataSourceTableUtils
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
@@ -51,7 +52,7 @@ private[libsvm] class LibSVMOutputWriter(
     new TextOutputFormat[NullWritable, Text]() {
       override def getDefaultWorkFile(context: TaskAttemptContext, extension: String): Path = {
         val configuration = context.getConfiguration
-        val uniqueWriteJobId = configuration.get("spark.sql.sources.writeJobUUID")
+        val uniqueWriteJobId = configuration.get(CreateDataSourceTableUtils.DATASOURCE_WRITEJOBUUID)
         val taskAttemptId = context.getTaskAttemptID
         val split = taskAttemptId.getTaskID.getId
         new Path(path, f"part-r-$split%05d-$uniqueWriteJobId$extension")
@@ -90,7 +91,7 @@ private[libsvm] class LibSVMOutputWriter(
  *     .load("data/mllib/sample_libsvm_data.txt")
  *
  *   // Java
- *   DataFrame df = spark.read().format("libsvm")
+ *   Dataset<Row> df = spark.read().format("libsvm")
  *     .option("numFeatures, "780")
  *     .load("data/mllib/sample_libsvm_data.txt");
  * }}}
@@ -105,9 +106,13 @@ private[libsvm] class LibSVMOutputWriter(
  *  - "vectorType": feature vector type, "sparse" (default) or "dense".
  *
  *  @see [[https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/ LIBSVM datasets]]
+ *
+ * Note that this class is public for documentation purpose. Please don't use this class directly.
+ * Rather, use the data source API as illustrated above.
  */
+// If this is moved or renamed, please update DataSource's backwardCompatibilityMap.
 @Since("1.6.0")
-class DefaultSource extends FileFormat with DataSourceRegister {
+class LibSVMFileFormat extends TextBasedFileFormat with DataSourceRegister {
 
   @Since("1.6.0")
   override def shortName(): String = "libsvm"
@@ -136,7 +141,7 @@ class DefaultSource extends FileFormat with DataSourceRegister {
       sparkSession: SparkSession,
       options: Map[String, String],
       files: Seq[FileStatus]): Map[String, String] = {
-    def computeNumFeatures(): Int = {
+    val numFeatures = options.get("numFeatures").filter(_.toInt > 0).getOrElse {
       val dataFiles = files.filterNot(_.getPath.getName startsWith "_")
       val path = if (dataFiles.length == 1) {
         dataFiles.head.getPath.toUri.toString
@@ -149,10 +154,6 @@ class DefaultSource extends FileFormat with DataSourceRegister {
       val sc = sparkSession.sparkContext
       val parsed = MLUtils.parseLibSVMFile(sc, path, sc.defaultParallelism)
       MLUtils.computeNumFeatures(parsed)
-    }
-
-    val numFeatures = options.get("numFeatures").filter(_.toInt > 0).getOrElse {
-      computeNumFeatures()
     }
 
     new CaseInsensitiveMap(options + ("numFeatures" -> numFeatures.toString))
@@ -203,25 +204,18 @@ class DefaultSource extends FileFormat with DataSourceRegister {
           }
 
       val converter = RowEncoder(dataSchema)
-
-      val unsafeRowIterator = points.map { pt =>
-        val features = if (sparse) pt.features.toSparse else pt.features.toDense
-        converter.toRow(Row(pt.label, features))
-      }
-
-      def toAttribute(f: StructField): AttributeReference =
+      val fullOutput = dataSchema.map { f =>
         AttributeReference(f.name, f.dataType, f.nullable, f.metadata)()
-
-      // Appends partition values
-      val fullOutput = (dataSchema ++ partitionSchema).map(toAttribute)
-      val requiredOutput = fullOutput.filter { a =>
-        requiredSchema.fieldNames.contains(a.name) || partitionSchema.fieldNames.contains(a.name)
       }
-      val joinedRow = new JoinedRow()
-      val appendPartitionColumns = GenerateUnsafeProjection.generate(requiredOutput, fullOutput)
+      val requiredOutput = fullOutput.filter { a =>
+        requiredSchema.fieldNames.contains(a.name)
+      }
 
-      unsafeRowIterator.map { dataRow =>
-        appendPartitionColumns(joinedRow(dataRow, file.partitionValues))
+      val requiredColumns = GenerateUnsafeProjection.generate(requiredOutput, fullOutput)
+
+      points.map { pt =>
+        val features = if (sparse) pt.features.toSparse else pt.features.toDense
+        requiredColumns(converter.toRow(Row(pt.label, features)))
       }
     }
   }
