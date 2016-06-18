@@ -45,6 +45,10 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.storage.StorageLevel
 
+
+import scala.collection.mutable.Stack
+import org.apache.spark.ml.optim._
+
 /**
  * Params for linear regression.
  */
@@ -159,10 +163,333 @@ class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String
   def setSolver(value: String): this.type = set(solver, value)
   setDefault(solver -> "auto")
 
+
+  
+  protected[spark] def train_batch(eid: String, handle: Long, weight_sum: Double, data_mean: Array[Double], data_std: Array[Double], lable_mean: Double, lable_std: Double): (LinearRegressionModel, Double, Array[Double]) = {
+
+    var timer = Stack[Long]()
+    var time = System.currentTimeMillis()
+    timer.push(time)
+
+    val numFeatures = data_std.size
+
+    val yMean = lable_mean
+    val rawYStd = lable_std
+
+    // if y is constant (rawYStd is zero), then y cannot be scaled. In this case
+    // setting yStd=1.0 ensures that y is not scaled anymore in l-bfgs algorithm.
+    val yStd = if (rawYStd > 0) rawYStd else math.abs(yMean)
+
+    val featuresMean = data_mean.clone
+    val featuresStd = data_std
+
+    //    printf("yMean=%e rawYStad=%e yStd=%e featuresMean(0)=%e \n", yMean, rawYStd, yStd, featuresMean(0));
+
+    // Since we implicitly do the feature scaling when we compute the cost function
+    // to improve the convergence, the effective regParam will be changed.
+    val effectiveRegParam = $(regParam) / yStd
+    val effectiveL1RegParam = $(elasticNetParam) * effectiveRegParam
+    val effectiveL2RegParam = (1.0 - $(elasticNetParam)) * effectiveRegParam
+
+    val costFun = new LeastSquaresCostFun_CuAcc_Batch(eid, handle, weight_sum, yMean / yStd, $(fitIntercept),
+      $(standardization), featuresStd, effectiveL2RegParam)
+
+    val optimizer = if ($(elasticNetParam) == 0.0 || effectiveRegParam == 0.0) {
+      new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+    } else {
+      val standardizationParam = $(standardization)
+      def effectiveL1RegFun = (index: Int) => {
+        if (standardizationParam) {
+          effectiveL1RegParam
+        } else {
+          // If `standardization` is false, we still standardize the data
+          // to improve the rate of convergence; as a result, we have to
+          // perform this reverse standardization by penalizing each component
+          // differently to get effectively the same objective function when
+          // the training dataset is not standardized.
+          if (featuresStd(index) != 0.0) effectiveL1RegParam / featuresStd(index) else 0.0
+        }
+      }
+
+      def fast_effectiveL1RegFun = (index: Int) => {
+        effectiveL1RegParam
+      }
+
+      new BreezeOWLQN[Int, BDV[Double]]($(maxIter), 10,
+        if (standardizationParam) fast_effectiveL1RegFun
+        else effectiveL1RegFun,
+        $(tol))
+    }
+
+    val initialCoefficients = Vectors.zeros(numFeatures)
+    val states = optimizer.iterations(new CachedDiffFunction(costFun),
+      initialCoefficients.asBreeze.toDenseVector)
+
+    val (coefficients, objectiveHistory) = {
+      /*
+         Note that in Linear Regression, the objective history (loss + regularization) returned
+         from optimizer is computed in the scaled space given by the following formula.
+         {{{
+         L = 1/2n||\sum_i w_i(x_i - \bar{x_i}) / \hat{x_i} - (y - \bar{y}) / \hat{y}||^2 + regTerms
+         }}}
+       */
+
+      time = System.currentTimeMillis()
+      timer.push(time)
+
+      val arrayBuilder = mutable.ArrayBuilder.make[Double]
+      var state: optimizer.State = null
+      while (states.hasNext) {
+        state = states.next()
+        arrayBuilder += state.adjustedValue
+      }
+      if (state == null) {
+        val msg = s"${optimizer.getClass.getName} failed."
+        logError(msg)
+        throw new SparkException(msg)
+      }
+
+      time = System.currentTimeMillis()
+      printf("%s]*****optimizer took %d ms regParam=%e : %s\n", eid, time - timer.pop(), $(regParam), state.convergedReason.toString());
+      timer.push(time)
+
+      /*
+         The coefficients are trained in the scaled space; we're converting them back to
+         the original space.
+       */
+      val rawCoefficients = state.x.toArray.clone()
+      var i = 0
+      val len = rawCoefficients.length
+      while (i < len) {
+        rawCoefficients(i) *= { if (featuresStd(i) != 0.0) yStd / featuresStd(i) else 0.0 }
+        i += 1
+      }
+
+      (Vectors.dense(rawCoefficients).compressed, arrayBuilder.result())
+    }
+
+    /*
+       The intercept in R's GLMNET is computed using closed form after the coefficients are
+       converged. See the following discussion for detail.
+       http://stats.stackexchange.com/questions/13617/how-is-the-intercept-computed-in-glmnet
+     */
+    val intercept = if ($(fitIntercept)) {
+
+      require(coefficients != null, "coefficients is NULL\n")
+      require(featuresMean != null, "featuresMean is NULL\n")
+
+      val fvec = Vectors.dense(featuresMean)
+
+      //      printf("yMean=%e rawYStad=%e yStd=%e featuresMean.size=%d featuresMean(0)=%e  featuresMean(5)=%e\n", yMean, rawYStd, yStd, featuresMean.size, featuresMean(0), fvec(5));
+
+      require(fvec != null, "coefficients is NULL\n")
+
+      yMean - dot(coefficients, fvec)
+    } else {
+      0.0
+    }
+
+    (copyValues(new LinearRegressionModel(uid, coefficients, intercept)), CuAccManager.compute_rmse_batch(handle, coefficients.toArray, intercept), objectiveHistory)
+
+  }
+
+  protected def train(dataset: Dataset[_], dataset_rdd: RDD[Row], lib_gpu: String): LinearRegressionModel = {
+
+    var timer = Stack[Long]()
+    var time = System.currentTimeMillis()
+    timer.push(time)
+
+	  val weighted = isDefined(weightCol) && !($(weightCol).isEmpty)
+
+    val (exec_info, exec_rdd, data_mean, data_std, lable_mean, lable_std, histogram, weight_sum) = 
+      CuAccManager.initialize(dataset_rdd, lib_gpu, "LinearRegression", weighted, $(fitIntercept))
+
+    val numFeatures = data_std.size
+
+    time = System.currentTimeMillis()
+    printf("%s] *****initialize took %d ms\n", uid, time - timer.pop());
+    timer.push(time)
+
+    val yMean = lable_mean
+    val rawYStd = lable_std
+    if (rawYStd == 0.0) {
+      if ($(fitIntercept) || yMean==0.0) {
+        // If the rawYStd is zero and fitIntercept=true, then the intercept is yMean with
+        // zero coefficient; as a result, training is not needed.
+        // Also, if yMean==0 and rawYStd==0, all the coefficients are zero regardless of
+        // the fitIntercept
+        if (yMean == 0.0) {
+          logWarning(s"Mean and standard deviation of the label are zero, so the coefficients " +
+            s"and the intercept will all be zero; as a result, training is not needed.")
+        } else {
+          logWarning(s"The standard deviation of the label is zero, so the coefficients will be " +
+            s"zeros and the intercept will be the mean of the label; as a result, " +
+            s"training is not needed.")
+        }
+
+        val coefficients = Vectors.sparse(numFeatures, Seq())
+        val intercept = yMean
+
+        val model = copyValues(new LinearRegressionModel(uid, coefficients, intercept))
+        // Handle possible missing or invalid prediction columns
+        val (summaryModel, predictionColName) = model.findSummaryModelAndPredictionCol()
+
+        val trainingSummary = new LinearRegressionTrainingSummary(
+          summaryModel.transform(dataset),
+          predictionColName,
+          $(labelCol),
+          $(featuresCol),
+          model,
+          Array(0D),
+          Array(0D))
+        return model.setSummary(trainingSummary)
+      } else {
+        require($(regParam) == 0.0, "The standard deviation of the label is zero. " +
+          "Model cannot be regularized.")
+        logWarning(s"The standard deviation of the label is zero. " +
+          "Consider setting fitIntercept=true.")
+      }
+    }
+
+	
+	
+    // if y is constant (rawYStd is zero), then y cannot be scaled. In this case
+    // setting yStd=1.0 ensures that y is not scaled anymore in l-bfgs algorithm.
+    val yStd = if (rawYStd > 0) rawYStd else math.abs(yMean)
+
+    val featuresMean = data_mean
+    val featuresStd = data_std
+
+    printf("yMean=%e rawYStad=%e yStd=%e featuresMean=%e featuresStd(0)=%e\n", yMean, rawYStd, yStd, featuresMean(0), featuresStd(0));
+
+    // Since we implicitly do the feature scaling when we compute the cost function
+    // to improve the convergence, the effective regParam will be changed.
+    val effectiveRegParam = $(regParam) / yStd
+    val effectiveL1RegParam = $(elasticNetParam) * effectiveRegParam
+    val effectiveL2RegParam = (1.0 - $(elasticNetParam)) * effectiveRegParam
+
+    val costFun = new LeastSquaresCostFun_CuAcc(exec_rdd, exec_info, weight_sum, yMean / yStd, $(fitIntercept),
+      $(standardization), featuresStd, effectiveL2RegParam)
+
+    val optimizer = if ($(elasticNetParam) == 0.0 || effectiveRegParam == 0.0) {
+      new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+    } else {
+      val standardizationParam = $(standardization)
+      def effectiveL1RegFun = (index: Int) => {
+        if (standardizationParam) {
+          effectiveL1RegParam
+        } else {
+          // If `standardization` is false, we still standardize the data
+          // to improve the rate of convergence; as a result, we have to
+          // perform this reverse standardization by penalizing each component
+          // differently to get effectively the same objective function when
+          // the training dataset is not standardized.
+          if (featuresStd(index) != 0.0) effectiveL1RegParam / featuresStd(index) else 0.0
+        }
+      }
+
+      def fast_effectiveL1RegFun = (index: Int) => {
+        effectiveL1RegParam
+      }
+
+      new BreezeOWLQN[Int, BDV[Double]]($(maxIter), 10,
+        if (standardizationParam) fast_effectiveL1RegFun
+        else effectiveL1RegFun,
+        $(tol))
+    }
+
+    val initialCoefficients = Vectors.zeros(numFeatures)
+    val states = optimizer.iterations(new CachedDiffFunction(costFun),
+      initialCoefficients.asBreeze.toDenseVector)
+
+    val (coefficients, objectiveHistory) = {
+      /*
+         Note that in Linear Regression, the objective history (loss + regularization) returned
+         from optimizer is computed in the scaled space given by the following formula.
+         {{{
+         L = 1/2n||\sum_i w_i(x_i - \bar{x_i}) / \hat{x_i} - (y - \bar{y}) / \hat{y}||^2 + regTerms
+         }}}
+       */
+
+      time = System.currentTimeMillis()
+      timer.push(time)
+
+      val arrayBuilder = mutable.ArrayBuilder.make[Double]
+      var state: optimizer.State = null
+      while (states.hasNext) {
+        state = states.next()
+        arrayBuilder += state.adjustedValue
+      }
+      if (state == null) {
+        val msg = s"${optimizer.getClass.getName} failed."
+        logError(msg)
+        throw new SparkException(msg)
+      }
+
+      time = System.currentTimeMillis()
+      printf("%s] *****optimizer took %d ms regParam=%e: %s\n", uid, time - timer.pop(), $(regParam), state.convergedReason.toString());
+
+      timer.push(time)
+
+      /*
+         The coefficients are trained in the scaled space; we're converting them back to
+         the original space.
+       */
+      val rawCoefficients = state.x.toArray.clone()
+      var i = 0
+      val len = rawCoefficients.length
+      while (i < len) {
+        rawCoefficients(i) *= { if (featuresStd(i) != 0.0) yStd / featuresStd(i) else 0.0 }
+        i += 1
+      }
+
+      (Vectors.dense(rawCoefficients).compressed, arrayBuilder.result())
+    }
+
+    /*
+       The intercept in R's GLMNET is computed using closed form after the coefficients are
+       converged. See the following discussion for detail.
+       http://stats.stackexchange.com/questions/13617/how-is-the-intercept-computed-in-glmnet
+     */
+    val intercept = if ($(fitIntercept)) {
+      yMean - dot(coefficients, Vectors.dense(featuresMean))
+    } else {
+      0.0
+    }
+
+    CuAccManager.destroy(exec_rdd, exec_info)
+
+    val model = copyValues(new LinearRegressionModel(uid, coefficients, intercept))
+    // Handle possible missing or invalid prediction columns
+    val (summaryModel, predictionColName) = model.findSummaryModelAndPredictionCol()
+
+    val trainingSummary = new LinearRegressionTrainingSummary(
+      summaryModel.transform(dataset),
+      predictionColName,
+      $(labelCol),
+      $(featuresCol),
+      model,
+      Array(0D),
+      objectiveHistory)
+    model.setSummary(trainingSummary)
+  }
+
   override protected def train(dataset: Dataset[_]): LinearRegressionModel = {
+
+    val w = if (!isDefined(weightCol) || $(weightCol).isEmpty) lit(1.0) else col($(weightCol))
+
+    val dataset_rdd = dataset.select(col($(labelCol)).cast(DoubleType), w, col($(featuresCol))).rdd
+    val lib_gpu = CuAccManager.get_lib_gpu(dataset_rdd.conf)
+
+    if (!lib_gpu.isEmpty()) {
+
+      val num_executor = CuAccManager.get_num_executor(dataset_rdd.context, lib_gpu)
+      return train(dataset, dataset_rdd.coalesce(num_executor, false), lib_gpu)
+    }
+
     // Extract the number of features before deciding optimization solver.
     val numFeatures = dataset.select(col($(featuresCol))).first().getAs[Vector](0).size
-    val w = if (!isDefined(weightCol) || $(weightCol).isEmpty) lit(1.0) else col($(weightCol))
+    
 
     if (($(solver) == "auto" && $(elasticNetParam) == 0.0 &&
       numFeatures <= WeightedLeastSquares.MAX_NUM_FEATURES) || $(solver) == "normal") {
