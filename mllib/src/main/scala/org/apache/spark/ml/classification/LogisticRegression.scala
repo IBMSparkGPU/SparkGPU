@@ -42,6 +42,8 @@ import org.apache.spark.sql.functions.{col, lit}
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.storage.StorageLevel
 
+import scala.collection.mutable.Stack
+import org.apache.spark.ml.optim._
 /**
  * Params for logistic regression.
  */
@@ -261,8 +263,323 @@ class LogisticRegression @Since("1.2.0") (
     train(dataset, handlePersistence)
   }
 
+
+  protected[spark] def train_batch(eid: String, handle: Long, weight_sum: Double, data_std: Array[Double], histogram: Array[Double]): (LogisticRegressionModel, Double, Array[Double]) = {
+
+    var timer = Stack[Long]()
+    var time = System.currentTimeMillis()
+    timer.push(time)
+
+    val numFeatures = data_std.size
+
+    val (coefficients, intercept, objectiveHistory) = {
+
+      val featuresStd = data_std
+      val regParamL1 = $(elasticNetParam) * $(regParam)
+      val regParamL2 = (1.0 - $(elasticNetParam)) * $(regParam)
+
+      val costFun = new LogisticCostFun_CuAcc_Batch(eid, handle, weight_sum, $(fitIntercept),
+        $(standardization), featuresStd, regParamL2)
+
+      val optimizer = if ($(elasticNetParam) == 0.0 || $(regParam) == 0.0) {
+        new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+      } else {
+        val standardizationParam = $(standardization)
+        def regParamL1Fun = (index: Int) => {
+          // Remove the L1 penalization on the intercept
+          if (index == numFeatures) {
+            0.0
+          } else {
+            if (standardizationParam) {
+              regParamL1
+            } else {
+              // If `standardization` is false, we still standardize the data
+              // to improve the rate of convergence; as a result, we have to
+              // perform this reverse standardization by penalizing each component
+              // differently to get effectively the same objective function when
+              // the training dataset is not standardized.
+              if (featuresStd(index) != 0.0) regParamL1 / featuresStd(index) else 0.0
+            }
+          }
+        }
+
+        def fast_regParamL1Fun = (index: Int) => {
+          // Remove the L1 penalization on the intercept
+          if (index == numFeatures) {
+            0.0
+          } else {
+            regParamL1
+          }
+        }
+
+        new BreezeOWLQN[Int, BDV[Double]]($(maxIter), 10,
+          if (standardizationParam) fast_regParamL1Fun
+          else regParamL1Fun,
+          $(tol))
+      }
+
+      val initialCoefficientsWithIntercept =
+        Vectors.zeros(if ($(fitIntercept)) numFeatures + 1 else numFeatures)
+
+      if (optInitialModel.isDefined && optInitialModel.get.coefficients.size != numFeatures) {
+        val vec = optInitialModel.get.coefficients
+        logWarning(
+          s"Initial coefficients provided $vec did not match the expected size $numFeatures")
+      }
+
+      if (optInitialModel.isDefined && optInitialModel.get.coefficients.size == numFeatures) {
+        val initialCoefficientsWithInterceptArray = initialCoefficientsWithIntercept.toArray
+        optInitialModel.get.coefficients.foreachActive {
+          case (index, value) =>
+            initialCoefficientsWithInterceptArray(index) = value
+        }
+        if ($(fitIntercept)) {
+          initialCoefficientsWithInterceptArray(numFeatures) == optInitialModel.get.intercept
+        }
+      } else if ($(fitIntercept)) {
+        /*
+             For binary logistic regression, when we initialize the coefficients as zeros,
+             it will converge faster if we initialize the intercept such that
+             it follows the distribution of the labels.
+
+             {{{
+               P(0) = 1 / (1 + \exp(b)), and
+               P(1) = \exp(b) / (1 + \exp(b))
+             }}}, hence
+             {{{
+               b = \log{P(1) / P(0)} = \log{count_1 / count_0}
+             }}}
+           */
+        initialCoefficientsWithIntercept.toArray(numFeatures) = math.log(
+          histogram(1) / histogram(0))
+      }
+
+      time = System.currentTimeMillis()
+      timer.push(time)
+
+      val states = optimizer.iterations(new CachedDiffFunction(costFun),
+        initialCoefficientsWithIntercept.asBreeze.toDenseVector)
+
+      /*
+           Note that in Logistic Regression, the objective history (loss + regularization)
+           is log-likelihood which is invariance under feature standardization. As a result,
+           the objective history from optimizer is the same as the one in the original space.
+         */
+      val arrayBuilder = mutable.ArrayBuilder.make[Double]
+      var state: optimizer.State = null
+      while (states.hasNext) {
+        state = states.next()
+        arrayBuilder += state.adjustedValue
+      }
+
+      if (state == null) {
+        val msg = s"${optimizer.getClass.getName} failed."
+        logError(msg)
+        throw new SparkException(msg)
+      }
+
+      time = System.currentTimeMillis()
+      printf("%s] *****optimizer took %d ms regParam=%f : %s\n", eid, time - timer.pop(), $(regParam), state.convergedReason.toString())
+      timer.push(time)
+
+      /*
+           The coefficients are trained in the scaled space; we're converting them back to
+           the original space.
+           Note that the intercept in scaled space and original space is the same;
+           as a result, no scaling is needed.
+         */
+      val rawCoefficients = state.x.toArray.clone()
+      var i = 0
+      while (i < numFeatures) {
+        rawCoefficients(i) *= { if (featuresStd(i) != 0.0) 1.0 / featuresStd(i) else 0.0 }
+        i += 1
+      }
+
+      if ($(fitIntercept)) {
+        (Vectors.dense(rawCoefficients.dropRight(1)).compressed, rawCoefficients.last,
+          arrayBuilder.result())
+      } else {
+        (Vectors.dense(rawCoefficients).compressed, 0.0, arrayBuilder.result())
+      }
+    }
+
+    (copyValues(new LogisticRegressionModel(uid, coefficients, intercept)), CuAccManager.compute_aug_batch(handle, coefficients.toArray, intercept), objectiveHistory)
+  }
+
+  protected[spark] def train(dataset: Dataset[_], dataset_rdd: RDD[Row], handlePersistence: Boolean, lib_gpu: String): LogisticRegressionModel = {
+
+    var timer = Stack[Long]()
+    var time = System.currentTimeMillis()
+    timer.push(time)
+
+	val weighted = isDefined(weightCol) && !($(weightCol).isEmpty)
+
+    val (exec_info, exec_rdd, data_mean, data_std, lable_mean, lable_std, histogram, num_sample) =
+      CuAccManager.initialize(dataset_rdd, lib_gpu, "LogisticRegression", weighted, $(fitIntercept))
+    val numFeatures = data_std.size
+
+    time = System.currentTimeMillis()
+    printf("%s] *****initialize took %d ms\n", uid, time - timer.pop());
+    timer.push(time)
+
+    val (coefficients, intercept, objectiveHistory) = {
+
+      val featuresStd = data_std
+      val regParamL1 = $(elasticNetParam) * $(regParam)
+      val regParamL2 = (1.0 - $(elasticNetParam)) * $(regParam)
+
+      val costFun = new LogisticCostFun_CuAcc(exec_rdd, exec_info, num_sample, $(fitIntercept),
+        $(standardization), featuresStd, regParamL2)
+
+      val optimizer = if ($(elasticNetParam) == 0.0 || $(regParam) == 0.0) {
+        new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+      } else {
+        val standardizationParam = $(standardization)
+        def regParamL1Fun = (index: Int) => {
+          // Remove the L1 penalization on the intercept
+          if (index == numFeatures) {
+            0.0
+          } else {
+            if (standardizationParam) {
+              regParamL1
+            } else {
+              // If `standardization` is false, we still standardize the data
+              // to improve the rate of convergence; as a result, we have to
+              // perform this reverse standardization by penalizing each component
+              // differently to get effectively the same objective function when
+              // the training dataset is not standardized.
+              if (featuresStd(index) != 0.0) regParamL1 / featuresStd(index) else 0.0
+            }
+          }
+        }
+
+        def fast_regParamL1Fun = (index: Int) => {
+          // Remove the L1 penalization on the intercept
+          if (index == numFeatures) {
+            0.0
+          } else {
+            regParamL1
+          }
+        }
+
+        new BreezeOWLQN[Int, BDV[Double]]($(maxIter), 10,
+          if (standardizationParam) fast_regParamL1Fun
+          else regParamL1Fun,
+          $(tol))
+      }
+
+      val initialCoefficientsWithIntercept =
+        Vectors.zeros(if ($(fitIntercept)) numFeatures + 1 else numFeatures)
+
+      if (optInitialModel.isDefined && optInitialModel.get.coefficients.size != numFeatures) {
+        val vec = optInitialModel.get.coefficients
+        logWarning(
+          s"Initial coefficients provided $vec did not match the expected size $numFeatures")
+      }
+
+      if (optInitialModel.isDefined && optInitialModel.get.coefficients.size == numFeatures) {
+        val initialCoefficientsWithInterceptArray = initialCoefficientsWithIntercept.toArray
+        optInitialModel.get.coefficients.foreachActive {
+          case (index, value) =>
+            initialCoefficientsWithInterceptArray(index) = value
+        }
+        if ($(fitIntercept)) {
+          initialCoefficientsWithInterceptArray(numFeatures) == optInitialModel.get.intercept
+        }
+      } else if ($(fitIntercept)) {
+        /*
+             For binary logistic regression, when we initialize the coefficients as zeros,
+             it will converge faster if we initialize the intercept such that
+             it follows the distribution of the labels.
+
+             {{{
+               P(0) = 1 / (1 + \exp(b)), and
+               P(1) = \exp(b) / (1 + \exp(b))
+             }}}, hence
+             {{{
+               b = \log{P(1) / P(0)} = \log{count_1 / count_0}
+             }}}
+           */
+        initialCoefficientsWithIntercept.toArray(numFeatures) = math.log(
+          histogram(1) / histogram(0))
+      }
+
+      time = System.currentTimeMillis()
+      timer.push(time)
+
+      val states = optimizer.iterations(new CachedDiffFunction(costFun),
+        initialCoefficientsWithIntercept.asBreeze.toDenseVector)
+
+      /*
+           Note that in Logistic Regression, the objective history (loss + regularization)
+           is log-likelihood which is invariance under feature standardization. As a result,
+           the objective history from optimizer is the same as the one in the original space.
+         */
+      val arrayBuilder = mutable.ArrayBuilder.make[Double]
+      var state: optimizer.State = null
+      while (states.hasNext) {
+        state = states.next()
+        arrayBuilder += state.adjustedValue
+      }
+
+      if (state == null) {
+        val msg = s"${optimizer.getClass.getName} failed."
+        logError(msg)
+        throw new SparkException(msg)
+      }
+
+      time = System.currentTimeMillis()
+      val time_diff = time - timer.pop()
+      printf("%s] *****optimizer took %d ms regParam=%f: %s\n", uid, time - timer.pop(), $(regParam), state.convergedReason.toString());
+
+      if (time_diff > 35000) {
+        CuAccManager.dump(dataset_rdd, time_diff.toString() + ".dat")
+      }
+
+      /*
+           The coefficients are trained in the scaled space; we're converting them back to
+           the original space.
+           Note that the intercept in scaled space and original space is the same;
+           as a result, no scaling is needed.
+         */
+      val rawCoefficients = state.x.toArray.clone()
+      var i = 0
+      while (i < numFeatures) {
+        rawCoefficients(i) *= { if (featuresStd(i) != 0.0) 1.0 / featuresStd(i) else 0.0 }
+        i += 1
+      }
+
+      if ($(fitIntercept)) {
+        (Vectors.dense(rawCoefficients.dropRight(1)).compressed, rawCoefficients.last,
+          arrayBuilder.result())
+      } else {
+        (Vectors.dense(rawCoefficients).compressed, 0.0, arrayBuilder.result())
+      }
+    }
+
+    CuAccManager.destroy(exec_rdd, exec_info)
+
+    val model = copyValues(new LogisticRegressionModel(uid, coefficients, intercept))
+    val (summaryModel, probabilityColName) = model.findSummaryModelAndProbabilityCol()
+    val logRegSummary = new BinaryLogisticRegressionTrainingSummary(
+      summaryModel.transform(dataset),
+      probabilityColName,
+      $(labelCol),
+      $(featuresCol),
+      objectiveHistory)
+    model.setSummary(logRegSummary)
+  }
+
   protected[spark] def train(dataset: Dataset[_], handlePersistence: Boolean):
       LogisticRegressionModel = {
+    val dataset_rdd = dataset.select(col($(labelCol)).cast(DoubleType), col($(featuresCol))).rdd
+    val lib_gpu = CuAccManager.get_lib_gpu(dataset_rdd.conf)
+
+    if (!lib_gpu.isEmpty()) {
+      require(!isDefined(weightCol) || $(weightCol).isEmpty, "CuAcc doesn't support weighted logistic regresison")
+      val num_executor = CuAccManager.get_num_executor(dataset_rdd.context, lib_gpu)
+      return train(dataset, dataset_rdd.coalesce(num_executor, false), handlePersistence, lib_gpu)
+    }
     val w = if (!isDefined(weightCol) || $(weightCol).isEmpty) lit(1.0) else col($(weightCol))
     val instances: RDD[Instance] =
       dataset.select(col($(labelCol)).cast(DoubleType), w, col($(featuresCol))).rdd.map {
@@ -968,6 +1285,7 @@ private class LogisticAggregator(
       require(numFeatures == features.size, s"Dimensions mismatch when adding new instance." +
         s" Expecting $numFeatures but got ${features.size}.")
       require(weight >= 0.0, s"instance weight, $weight has to be >= 0.0")
+
 
       if (weight == 0.0) return this
 
