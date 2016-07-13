@@ -58,7 +58,6 @@ private[regression] trait LinearRegressionParams extends PredictorParams
     with HasFitIntercept with HasStandardization with HasWeightCol with HasSolver
 
 /**
- * :: Experimental ::
  * Linear regression.
  *
  * The learning objective is to minimize the squared error, with regularization.
@@ -72,7 +71,6 @@ private[regression] trait LinearRegressionParams extends PredictorParams
  *  - L2 + L1 (elastic net)
  */
 @Since("1.3.0")
-@Experimental
 class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String)
   extends Regressor[Vector, LinearRegression, LinearRegressionModel]
   with LinearRegressionParams with DefaultParamsWritable with Logging {
@@ -714,11 +712,9 @@ object LinearRegression extends DefaultParamsReadable[LinearRegression] {
 }
 
 /**
- * :: Experimental ::
  * Model produced by [[LinearRegression]].
  */
 @Since("1.3.0")
-@Experimental
 class LinearRegressionModel private[ml] (
     @Since("1.4.0") override val uid: String,
     @Since("2.0.0") val coefficients: Vector,
