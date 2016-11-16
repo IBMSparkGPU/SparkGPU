@@ -236,6 +236,8 @@ class ALS private (
    */
   @Since("0.8.0")
   def run(ratings: RDD[Rating]): MatrixFactorizationModel = {
+    require(!ratings.isEmpty(), s"No ratings available from $ratings")
+
     val sc = ratings.context
 
     val use_gpu = System.getenv("SPARK_GPU")
