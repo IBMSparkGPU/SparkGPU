@@ -240,7 +240,7 @@ class ALS private (
 
     val sc = ratings.context
 
-    val use_gpu = System.getenv("SPARK_GPU")
+    val use_gpu = System.getProperty("spark.mllib.ALS.useGPU")
 
     if (implicitPrefs || nonnegative || use_gpu == null ) {
 
@@ -287,23 +287,23 @@ class ALS private (
 
       val start_time = System.currentTimeMillis();
     
+      logDebug("Loading the GPU library now, debug information " + 
+        "requested, times are elapsed times after THIS point in time")
+        
       System.load(use_gpu)
-    
-      printf("ALS.run.train cp0 took %d ms\n", System.currentTimeMillis() - start_time);
-
+ 
       val num_rating = ratings.count().toInt
       val num_user = ratings.map(_.user).distinct().count().toInt
       val num_prod = ratings.map(_.product).distinct().count().toInt
 
-      printf("ALS.run.train cp1 took %d ms\n", System.currentTimeMillis() - start_time);
+      logDebug("ALS.run.train (part 1) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms");
      
       var row_idx = new Array[Int](num_rating)
       var col_idx = new Array[Int](num_rating)
       var rating = new Array[Float](num_rating)
       var index = 0
       
-      printf("ALS.run.train cp2 took %d ms\n", System.currentTimeMillis() - start_time)
-
       ratings.collect().foreach { x =>
         row_idx(index) = x.user
         col_idx(index) = x.product
@@ -311,33 +311,31 @@ class ALS private (
         index = index + 1
       }
 
-      printf("ALS.run.train cp3 took %d ms\n", System.currentTimeMillis() - start_time)
-     
-      ////////////////////////////////////////////////////////////////////////
-      // call external algorithm
-      ////////////////////////////////////////////////////////////////////////
+      logDebug("ALS.run.train (part 2) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms");       
+
+      // Now call our external algorithm
 
       var engine = new gpuALS
-
-      printf("ALS.run.train cp4 took %d ms\n", System.currentTimeMillis() - start_time)
+      
       engine.factorize(rank,num_user,num_prod,num_rating,row_idx,col_idx,rating,lambda,iterations)
       
-      printf("ALS.run.train cp5 took %d ms\n", System.currentTimeMillis() - start_time)
+      logDebug("ALS.run.train (part 3) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms");
 
       val user = engine.getUser()
       val prod = engine.getProd()
 
+      logDebug("ALS.run.train (part 4) completed after " +
+        (System.currentTimeMillis() - start_time) + " ms")
 
-      printf("ALS.run.train cp6 took %d ms\n", System.currentTimeMillis() - start_time)
-
-      ////////////////////////////////////////////////////////////////////////
-      // retrieve result
-      ////////////////////////////////////////////////////////////////////////
+      // Retrieve result
 
       var user_arr = new Array[(Int, Array[Double])](num_user.toInt)
       var prod_arr = new Array[(Int, Array[Double])](num_prod.toInt)
       
-      printf("ALS.run.train cp7 took %d ms\n", System.currentTimeMillis() - start_time)
+      logDebug("ALS.run.train (part 5) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms");
 
       for (i <- 0 until num_user.toInt) {
         var data = user.slice(i * rank, (i + 1) * rank).map {_.toDouble }        
@@ -349,21 +347,25 @@ class ALS private (
         prod_arr.update(i, (i, data))
       }
       
-      printf("ALS.run.train cp8 took %d ms\n", System.currentTimeMillis() - start_time)
+      logDebug("ALS.run.train (part 6) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms");
 
       var userFactors = sc.parallelize(user_arr).setName("users")
         .persist(finalRDDStorageLevel)
+        
       var prodFactors = sc.parallelize(prod_arr).setName("products")
         .persist(finalRDDStorageLevel)
         
-      printf("ALS.run.train cp9 took %d ms\n", System.currentTimeMillis() - start_time)
+      logDebug("ALS.run.train (part 7) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms");
 
       if (finalRDDStorageLevel != StorageLevel.NONE) {
         userFactors.count()
         prodFactors.count()
       }
 
-      printf("ALS.run.train cp10 took %d ms\n", System.currentTimeMillis() - start_time);
+      logDebug("ALS.run.train (pt 8) completed after " + 
+        (System.currentTimeMillis() - start_time) + " ms")
       
       new MatrixFactorizationModel(rank, userFactors, prodFactors)
     }
